@@ -12,6 +12,9 @@
 from __future__ import annotations
 
 import asyncio
+import ast
+import hashlib
+import re
 from typing import Any, Literal
 
 import httpx
@@ -168,6 +171,7 @@ class GrokAvatarService(BaseService):
 
         if not avatar_bytes:
             raise RuntimeError("抓取到的头像为空，拒绝发起无图片生成请求。")
+        logger.info(f"生成输入 sha256={hashlib.sha256(avatar_bytes).hexdigest()} bytes={len(avatar_bytes)}")
 
         url = self._build_edits_url(api.base_url)
         form_data: dict[str, str] = {
@@ -272,7 +276,123 @@ class GrokAvatarService(BaseService):
         """
         try:
             avatar_bytes = await self.download_avatar(qq_number)
-            grok_bytes = await self.generate_grok_avatar(avatar_bytes, config)
+            return await self.make_avatar_from_bytes(avatar_bytes, config, mode)
+        except (RuntimeError, FrameError) as e:
+            return False, str(e)
+
+    async def resolve_chat_image(
+        self, stream_id: str, history_index: int = 0,
+        message_id: str | None = None, trigger_message: Any = None,
+        sender_id: str | None = None,
+    ) -> bytes:
+        """读取当前流原图，优先内存与核心落盘缓存，最后回查协议消息。"""
+        from src.app.plugin_system.api import media_api, service_api, stream_api
+
+        if history_index < 0:
+            raise RuntimeError("history_index 必须是非负整数。")
+        messages = await stream_api.get_stream_messages(stream_id, limit=100)
+        if trigger_message is not None:
+            messages = [msg for msg in messages if msg.message_id != trigger_message.message_id]
+            messages.append(trigger_message)
+        if not message_id:
+            request = next((msg for msg in reversed(messages)
+                            if not sender_id or str(getattr(msg, "sender_id", "")) == sender_id), None)
+            if request is not None:
+                reference = getattr(request, "reply_to", None)
+                if reference:
+                    message_id = str(reference)
+        if message_id and not any(str(msg.message_id) == message_id for msg in messages):
+            from src.core.models.message import Message
+
+            service = service_api.get_service("onebot_expand:service:message_service")
+            if service is not None:
+                result = await service.get_msg(message_id=message_id)
+                data = result.get("data") or {}
+                media = [{"type": "image", "url": segment.get("data", {}).get("url")}
+                         for segment in data.get("message", []) if segment.get("type") == "image"]
+                messages.append(Message(message_id=message_id, content={"media": media}, stream_id=stream_id))
+        candidates: list[tuple[Any, dict[str, Any]]] = []
+        for message in reversed(messages):
+            if message_id and str(message.message_id) != message_id:
+                continue
+            if not message_id and getattr(message, "sender_role", None) == "bot":
+                continue
+            if not message_id and sender_id and str(getattr(message, "sender_id", "")) != sender_id:
+                continue
+            content = message.content
+            if isinstance(content, str):
+                try:
+                    content = ast.literal_eval(content)
+                except (ValueError, SyntaxError):
+                    content = {}
+            media = content.get("media", []) if isinstance(content, dict) else []
+            if not media:
+                media = getattr(message, "extra", {}).get("media", [])
+            images = [item for item in media if isinstance(item, dict) and item.get("type") in {"image", "emoji"}]
+            if not images:
+                text = str(getattr(message, "processed_plain_text", "") or "")
+                images = [{"image_id": image_id} for image_id in re.findall(r"\[(?:图片|表情包)\(([^()]+)\)", text)]
+            candidates.extend((message, item) for item in images)
+        if history_index >= len(candidates):
+            raise RuntimeError("指定消息或最近 100 条聊天记录中没有对应图片。")
+        message, item = candidates[history_index]
+        logger.info(f"选定原图 message_id={message.message_id} image_id={item.get('image_id', '')} sender={getattr(message, 'sender_id', '')}")
+        encoded = item.get("data")
+        if isinstance(encoded, str) and encoded:
+            return decode_image_b64(encoded)
+        image_id = item.get("image_id")
+        if image_id:
+            try:
+                encoded = await media_api.get_media_file(str(image_id))
+                if encoded:
+                    return decode_image_b64(encoded)
+            except Exception as error:
+                logger.warning(f"原图缓存读取失败，尝试消息直链：{error}")
+        url = item.get("url")
+        if isinstance(url, str) and url.startswith(("https://", "http://")):
+            try:
+                return await self.resolve_specified_image(url)
+            except RuntimeError:
+                pass
+        service = service_api.get_service("onebot_expand:service:message_service")
+        if service is not None:
+            result = await service.get_msg(message_id=message.message_id)
+            data = result.get("data") or {}
+            segments = [seg for seg in data.get("message", []) if seg.get("type") == "image"]
+            image_offset = next((index for index, candidate in enumerate(
+                [candidate for owner, candidate in candidates if owner is message]
+            ) if candidate is item), 0)
+            if image_offset < len(segments):
+                url = segments[image_offset].get("data", {}).get("url")
+                if url:
+                    return await self.resolve_specified_image(url)
+        raise RuntimeError("原图缓存已丢失且消息直链不可用；请重新发送原图。")
+
+    async def resolve_specified_image(self, image: str) -> bytes:
+        """下载单张图片直链或解码 base64。"""
+        if not image.startswith(("https://", "http://")):
+            return decode_image_b64(image)
+        try:
+            async with httpx.AsyncClient(timeout=60, follow_redirects=True) as client:
+                async with client.stream("GET", image) as response:
+                    response.raise_for_status()
+                    chunks = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        chunks.extend(chunk)
+                        if len(chunks) > 20 * 1024 * 1024:
+                            raise RuntimeError("图片超过 20 MB 上限。")
+            if not chunks:
+                raise RuntimeError("下载到的图片为空。")
+            return bytes(chunks)
+        except httpx.HTTPError as e:
+            raise RuntimeError(f"原图下载失败：{e}") from e
+
+    async def make_avatar_from_bytes(
+        self, image_bytes: bytes, config: GrokAvatarConfig, mode: AvatarMode = "plain",
+    ) -> tuple[bool, str]:
+        """以本次选定的原图发起独立生成请求。"""
+        try:
+            grok_bytes = await self.generate_grok_avatar(image_bytes, config)
 
             if mode == "google_ring":
                 frame = config.frame

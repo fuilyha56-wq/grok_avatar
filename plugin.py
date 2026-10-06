@@ -12,6 +12,7 @@ from src.app.plugin_system.api.log_api import get_logger
 from src.app.plugin_system.base import BasePlugin, register_plugin
 
 from .config import GrokAvatarConfig
+from .commands import GrokAvatarCommand
 from .service import GrokAvatarService
 from .tools import GrokAvatarTool
 
@@ -31,7 +32,7 @@ class GrokAvatarPlugin(BasePlugin):
         if not cfg.plugin.enabled:
             logger.info("grok_avatar 插件未启用")
             return []
-        components: list[type] = [GrokAvatarService]
+        components: list[type] = [GrokAvatarService, GrokAvatarCommand]
         if cfg.plugin.tool_enabled:
             components.append(GrokAvatarTool)
         return components

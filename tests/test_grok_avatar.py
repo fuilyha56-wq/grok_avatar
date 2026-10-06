@@ -274,6 +274,126 @@ def test_tool_schema_exposes_mode_and_qq() -> None:
     props = params.get("properties", params) if isinstance(params, dict) else {}
     assert "mode" in props
     assert "qq_number" in props
+    for name in ("source", "message_id", "history_index", "mention_qq", "reply_to"):
+        assert name in props
+
+
+def test_command_routes_are_registered() -> None:
+    from ..commands import GrokAvatarCommand
+
+    command = GrokAvatarCommand.__new__(GrokAvatarCommand)
+    command._root = None
+    assert GrokAvatarCommand.name == "grok_avatar"
+    assert GrokAvatarCommand.permission_level.name == "USER"
+    assert hasattr(GrokAvatarCommand.handle_user, "_cmd_route")
+    assert hasattr(GrokAvatarCommand.handle_image, "_cmd_route")
+
+
+@pytest.mark.asyncio
+async def test_chat_image_uses_core_cache_without_onebot(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from src.app.plugin_system.api import media_api, stream_api, service_api
+
+    service = GrokAvatarService.__new__(GrokAvatarService)
+    original = _synthetic_grok_avatar()
+    message = SimpleNamespace(
+        message_id="image-message", sender_role="member", extra={},
+        content="{'media': [{'type': 'image', 'image_id': 'local-hash'}]}",
+    )
+
+    async def history(*args, **kwargs):
+        return [message]
+
+    async def cached(image_id):
+        assert image_id == "local-hash"
+        return encode_image_b64(original)
+
+    def forbidden(*args):
+        pytest.fail("核心缓存命中时不能调用 OneBot")
+
+    monkeypatch.setattr(stream_api, "get_stream_messages", history)
+    monkeypatch.setattr(media_api, "get_media_file", cached)
+    monkeypatch.setattr(service_api, "get_service", forbidden)
+    assert await service.resolve_chat_image("stream", message_id="image-message") == original
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("explicit_recipient", [None, "30003", ""])
+async def test_result_mentions_recipient_not_requester(monkeypatch, explicit_recipient) -> None:
+    from types import SimpleNamespace
+    from src.app.plugin_system.api import service_api
+    from .. import tools as tool_module
+
+    service = GrokAvatarService.__new__(GrokAvatarService)
+
+    async def generate(*args, **kwargs):
+        return True, "generated-image"
+
+    service.make_avatar = generate
+    tool = tool_module.GrokAvatarTool.__new__(tool_module.GrokAvatarTool)
+    tool.plugin = SimpleNamespace(config=GrokAvatarConfig())
+    tool.trigger_message = SimpleNamespace(
+        sender_id="10001", message_id="request-from-A", chat_type="group",
+    )
+    monkeypatch.setattr(tool_module.GrokAvatarTool, "get_current_stream_id", lambda self: "stream")
+    monkeypatch.setattr(service_api, "get_service", lambda signature: service)
+    calls = []
+
+    async def custom(**kwargs):
+        calls.append(("at", kwargs))
+        return True
+
+    async def image(**kwargs):
+        calls.append(("image", kwargs))
+        return True
+
+    monkeypatch.setattr(tool_module, "send_custom", custom)
+    monkeypatch.setattr(tool_module, "send_image", image)
+    ok, _ = await tool.execute(qq_number="20002", mention_qq=explicit_recipient)
+    assert ok
+    assert calls[-1][1]["reply_to"] is None
+    if explicit_recipient != "":
+        assert calls[0][1]["content"] == (explicit_recipient or "20002")
+    else:
+        assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_chat_image_fallback_preserves_image_offset(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from src.app.plugin_system.api import media_api, stream_api, service_api
+
+    service = GrokAvatarService.__new__(GrokAvatarService)
+    message = SimpleNamespace(
+        message_id="two-images", sender_role="member", extra={},
+        content={"media": [
+            {"type": "image", "image_id": "first"},
+            {"type": "image", "image_id": "second"},
+        ]},
+    )
+
+    async def history(*args, **kwargs):
+        return [message]
+
+    async def missing(*args):
+        return None
+
+    async def get_msg(message_id):
+        assert message_id == "two-images"
+        return {"data": {"message": [
+            {"type": "image", "data": {"url": "https://example.com/first"}},
+            {"type": "image", "data": {"url": "https://example.com/second"}},
+        ]}}
+
+    async def download(url):
+        assert url == "https://example.com/second"
+        return b"second-image"
+
+    monkeypatch.setattr(stream_api, "get_stream_messages", history)
+    monkeypatch.setattr(media_api, "get_media_file", missing)
+    monkeypatch.setattr(service_api, "get_service", lambda signature: SimpleNamespace(get_msg=get_msg))
+    monkeypatch.setattr(service, "resolve_specified_image", download)
+    assert await service.resolve_chat_image("stream", 1, "two-images") == b"second-image"
 
 
 def test_tool_resolve_qq_prefers_explicit_then_sender() -> None:
@@ -290,3 +410,30 @@ def test_tool_resolve_qq_prefers_explicit_then_sender() -> None:
 
     tool.trigger_message = None
     assert tool._resolve_qq(None) == ""
+
+
+@pytest.mark.asyncio
+async def test_sender_request_reference_wins_over_other_member_latest_image(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from src.app.plugin_system.api import media_api, stream_api
+
+    original = _synthetic_grok_avatar()
+    messages = [
+        SimpleNamespace(message_id="original-A", sender_id="A", reply_to=None,
+                        content={"media": [{"type": "image", "image_id": "correct"}]}),
+        SimpleNamespace(message_id="request-A", sender_id="A", reply_to="original-A", content="用这张图"),
+        SimpleNamespace(message_id="latest-B", sender_id="B", reply_to=None,
+                        content={"media": [{"type": "image", "image_id": "wrong"}]}),
+    ]
+
+    async def history(*args, **kwargs):
+        return messages
+
+    async def cached(image_id):
+        assert image_id == "correct"
+        return encode_image_b64(original)
+
+    monkeypatch.setattr(stream_api, "get_stream_messages", history)
+    monkeypatch.setattr(media_api, "get_media_file", cached)
+    service = GrokAvatarService.__new__(GrokAvatarService)
+    assert await service.resolve_chat_image("stream", trigger_message=messages[-1], sender_id="A") == original
